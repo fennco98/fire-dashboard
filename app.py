@@ -3,13 +3,11 @@
 Run with:  streamlit run app.py
 """
 
-import dataclasses
-
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from fire_sim import ACCOUNT_NAMES, SimConfig, run_comparison, run_portfolio
+from fire_sim import SimConfig, run_comparison, run_portfolio_auto
 
 
 # ---------- Page setup ----------
@@ -27,12 +25,6 @@ with st.sidebar:
     st.header("Your inputs")
 
     st.subheader("Contributions & timeline")
-    primary_account = st.selectbox(
-        "Primary tax-advantaged account",
-        ACCOUNT_NAMES,
-        help="Which account type you're actively contributing to. "
-             "Used for the progress bar and portfolio chart.",
-    )
     gross_devoted = st.number_input(
         "Annual gross income to invest ($)",
         min_value=0, value=25_000, step=1_000,
@@ -71,11 +63,9 @@ with st.sidebar:
     st.subheader("Taxable brokerage")
     starting_taxable = st.number_input(
         "Current balance ($)", min_value=0, value=0, step=1_000,
+        help="Any overflow from the annual gross devoted — after maxing "
+             "the 401(k) and Roth IRA — spills into this account automatically.",
         key="taxable_start")
-    taxable_annual = st.number_input(
-        "Annual contribution ($)", min_value=0, value=0, step=1_000,
-        help="Post-tax dollars added to the taxable account each year.",
-        key="taxable_annual")
 
     st.subheader("Private stock / equity")
     private_stock_value = st.number_input(
@@ -128,7 +118,6 @@ cfg = SimConfig(
     starting_roth_ira=float(starting_roth_ira),
     starting_hsa=float(starting_hsa),
     starting_taxable=float(starting_taxable),
-    taxable_annual=float(taxable_annual),
     private_stock_value=float(private_stock_value),
     private_stock_growth=private_stock_growth,
     limit_401k=float(limit_401k),
@@ -137,7 +126,7 @@ cfg = SimConfig(
     include_hsa=include_hsa,
 )
 
-portfolio = run_portfolio(cfg, primary_account)
+portfolio, alloc = run_portfolio_auto(cfg)
 
 current_total = sum(r.effective_balance[0] for r in portfolio)
 projected_total = sum(r.effective_balance[-1] for r in portfolio)
@@ -177,6 +166,23 @@ else:
         f"({1 - progress_proj:.1%} of target remaining)."
     )
 
+# Allocation breakdown
+with st.expander("Annual contribution breakdown"):
+    alloc_rows = [
+        ("Traditional 401(k)", alloc["trad_401k"], "Pre-tax"),
+    ]
+    if cfg.include_hsa:
+        alloc_rows.append(("HSA", alloc["hsa"], "Pre-tax"))
+    alloc_rows.append(("Roth IRA", alloc["roth_ira"], "Post-tax"))
+    alloc_rows.append(("Taxable brokerage (overflow)", alloc["taxable"], "Post-tax"))
+    df_alloc = pd.DataFrame(alloc_rows, columns=["Account", "Annual amount", "Tax treatment"])
+    df_alloc["Annual amount"] = df_alloc["Annual amount"].apply(lambda x: f"${x:,.0f}")
+    st.dataframe(df_alloc, hide_index=True, use_container_width=True)
+    st.caption(
+        "Allocation order: 401(k) to limit → HSA to limit (if enabled) → "
+        "Roth IRA to limit → taxable brokerage with any remainder."
+    )
+
 st.divider()
 
 
@@ -187,9 +193,11 @@ tab_portfolio, tab_comparison = st.tabs(["Your portfolio", "Account type compari
 years_axis = list(range(years + 1))
 
 with tab_portfolio:
-    st.subheader(f"Effective balance over time — your portfolio")
+    st.subheader("Effective balance over time — your portfolio")
     st.caption(
         "Stacked area showing how each piece of your portfolio grows. "
+        "Annual gross devoted is auto-allocated: 401(k) first, then Roth IRA, "
+        "then taxable brokerage with any overflow. "
         "Balances shown are after estimated withdrawal / capital-gains taxes."
     )
 
@@ -309,7 +317,7 @@ with tab_comparison:
 with st.expander("Assumptions and known limitations"):
     st.markdown(
         """
-- **Gross income devoted is held constant** across all comparison account types; the simulator handles tax timing.
+- **Portfolio view auto-allocates** gross income devoted in tax-efficiency order: 401(k) → HSA (if enabled) → Roth IRA → taxable brokerage overflow. The comparison tab feeds the full gross amount to each account type independently for side-by-side evaluation.
 - **Returns are constant, nominal, and deterministic.** No inflation adjustment, no volatility, no sequence-of-returns risk. Use ~7% if you want results in today's dollars.
 - **Private stock growth** is your own assumption and may be real or nominal — be consistent with the main return slider.
 - **Single tax bracket approximation.** Real brackets are progressive; marginal rate is an approximation.

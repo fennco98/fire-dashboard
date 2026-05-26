@@ -1,11 +1,14 @@
 """FIRE retirement account simulator.
 
-Compares Traditional 401(k), Roth 401(k), Traditional IRA, and Roth IRA, plus
-optional taxable brokerage and private stock, over a multi-year horizon.
+Portfolio view: gross income devoted to retirement is auto-allocated across
+accounts in tax-efficiency order —
+  1. Traditional 401(k) (pre-tax, reduces taxable income today)
+  2. HSA if enabled (triple-tax-free)
+  3. Roth IRA (tax-free growth; funded from remaining after-tax dollars)
+  4. Taxable brokerage (overflow)
 
-All comparison accounts are fed the same pre-tax gross income devoted to
-retirement — the tax timing (paid now for Roth, paid at withdrawal for
-Traditional) is handled inside each function.
+Comparison view: all four tax-advantaged account types are projected
+independently from the same gross input for side-by-side evaluation.
 
 All functions are pure — no module state, safe to call repeatedly.
 """
@@ -13,7 +16,7 @@ All functions are pure — no module state, safe to call repeatedly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Tuple
 
 
 # ---------- Config ----------
@@ -37,10 +40,7 @@ class SimConfig:
     starting_trad_ira: float = 0.0
     starting_roth_ira: float = 0.0
     starting_hsa: float = 0.0
-
-    # Taxable brokerage
     starting_taxable: float = 0.0
-    taxable_annual: float = 0.0     # post-tax dollars added per year
 
     # Private stock / equity (no annual contributions — just growth)
     private_stock_value: float = 0.0
@@ -57,7 +57,7 @@ class SimConfig:
 @dataclass
 class AccountResult:
     name: str
-    annual_contribution: float      # employee dollars added per year
+    annual_contribution: float      # dollars added per year (post-tax for Roth/taxable)
     pretax_balance: List[float]     # nominal account balance per year (length = years+1)
     effective_balance: List[float]  # what you keep after any withdrawal taxes
 
@@ -78,13 +78,51 @@ def _compound(annual: float, growth: float, years: int,
     return path
 
 
-# ---------- Account simulations ----------
+# ---------- Allocation ----------
 
-def traditional_401k(cfg: SimConfig) -> AccountResult:
+def allocate(cfg: SimConfig) -> Dict[str, float]:
+    """Distribute gross_devoted across accounts in tax-efficiency order.
+
+    Returns a dict of annual contribution amounts:
+      trad_401k  — pre-tax dollars going into the 401(k)
+      hsa        — pre-tax dollars going into the HSA (0 if not enabled)
+      roth_ira   — post-tax dollars going into the Roth IRA
+      taxable    — post-tax dollars going to the taxable brokerage (overflow)
+    """
+    remaining_gross = cfg.gross_devoted
+
+    # 1. Traditional 401(k): pre-tax, capped at employee limit
+    trad_401k = min(remaining_gross, cfg.limit_401k)
+    remaining_gross -= trad_401k
+
+    # 2. HSA: pre-tax, triple-tax-free (only if enabled)
+    hsa_contrib = 0.0
+    if cfg.include_hsa:
+        hsa_contrib = min(remaining_gross, cfg.limit_hsa)
+        remaining_gross -= hsa_contrib
+
+    # 3. Roth IRA: funded from remaining pre-tax budget converted to after-tax
+    after_tax_remaining = remaining_gross * (1 - cfg.marginal_tax_now)
+    roth_ira = min(after_tax_remaining, cfg.limit_ira)
+    after_tax_remaining -= roth_ira
+
+    # 4. Taxable brokerage: whatever after-tax dollars are left
+    taxable = after_tax_remaining
+
+    return {
+        "trad_401k": trad_401k,
+        "hsa": hsa_contrib,
+        "roth_ira": roth_ira,
+        "taxable": taxable,
+    }
+
+
+# ---------- Individual account simulations ----------
+
+def traditional_401k(cfg: SimConfig, annual_override: float | None = None) -> AccountResult:
     """Pre-tax contribution, taxed as ordinary income at withdrawal."""
-    contribution = min(cfg.gross_devoted, cfg.limit_401k)
-    path = _compound(contribution, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_trad_401k)
+    contribution = annual_override if annual_override is not None else min(cfg.gross_devoted, cfg.limit_401k)
+    path = _compound(contribution, cfg.annual_growth_rate, cfg.years, cfg.starting_trad_401k)
     effective = [b * (1 - cfg.marginal_tax_retirement) for b in path]
     return AccountResult(
         name="Traditional 401(k)",
@@ -98,8 +136,7 @@ def roth_401k(cfg: SimConfig) -> AccountResult:
     """Post-tax contribution; growth and withdrawals tax-free."""
     aftertax_available = cfg.gross_devoted * (1 - cfg.marginal_tax_now)
     contribution = min(aftertax_available, cfg.limit_401k)
-    path = _compound(contribution, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_roth_401k)
+    path = _compound(contribution, cfg.annual_growth_rate, cfg.years, cfg.starting_roth_401k)
     return AccountResult(
         name="Roth 401(k)",
         annual_contribution=contribution,
@@ -109,13 +146,9 @@ def roth_401k(cfg: SimConfig) -> AccountResult:
 
 
 def traditional_ira(cfg: SimConfig) -> AccountResult:
-    """Deductible Traditional IRA: pre-tax contribution, taxed at withdrawal.
-
-    Assumes deductibility (see caveats for income phase-out limits).
-    """
+    """Deductible Traditional IRA: pre-tax contribution, taxed at withdrawal."""
     contribution = min(cfg.gross_devoted, cfg.limit_ira)
-    path = _compound(contribution, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_trad_ira)
+    path = _compound(contribution, cfg.annual_growth_rate, cfg.years, cfg.starting_trad_ira)
     effective = [b * (1 - cfg.marginal_tax_retirement) for b in path]
     return AccountResult(
         name="Traditional IRA",
@@ -125,12 +158,14 @@ def traditional_ira(cfg: SimConfig) -> AccountResult:
     )
 
 
-def roth_ira(cfg: SimConfig) -> AccountResult:
+def roth_ira(cfg: SimConfig, annual_override: float | None = None) -> AccountResult:
     """Post-tax contribution, tax-free growth and withdrawals."""
-    aftertax_available = cfg.gross_devoted * (1 - cfg.marginal_tax_now)
-    contribution = min(aftertax_available, cfg.limit_ira)
-    path = _compound(contribution, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_roth_ira)
+    if annual_override is not None:
+        contribution = annual_override
+    else:
+        aftertax_available = cfg.gross_devoted * (1 - cfg.marginal_tax_now)
+        contribution = min(aftertax_available, cfg.limit_ira)
+    path = _compound(contribution, cfg.annual_growth_rate, cfg.years, cfg.starting_roth_ira)
     return AccountResult(
         name="Roth IRA",
         annual_contribution=contribution,
@@ -139,11 +174,10 @@ def roth_ira(cfg: SimConfig) -> AccountResult:
     )
 
 
-def hsa(cfg: SimConfig) -> AccountResult:
-    """HSA for qualified medical: triple-tax-free. Requires HDHP."""
-    contribution = min(cfg.gross_devoted, cfg.limit_hsa)
-    path = _compound(contribution, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_hsa)
+def hsa(cfg: SimConfig, annual_override: float | None = None) -> AccountResult:
+    """HSA for qualified medical expenses: triple-tax-free. Requires HDHP."""
+    contribution = annual_override if annual_override is not None else min(cfg.gross_devoted, cfg.limit_hsa)
+    path = _compound(contribution, cfg.annual_growth_rate, cfg.years, cfg.starting_hsa)
     return AccountResult(
         name="HSA",
         annual_contribution=contribution,
@@ -152,18 +186,18 @@ def hsa(cfg: SimConfig) -> AccountResult:
     )
 
 
-def taxable_brokerage(cfg: SimConfig) -> AccountResult:
-    """Post-tax contributions; long-term capital gains tax on growth at sale."""
-    path = _compound(cfg.taxable_annual, cfg.annual_growth_rate, cfg.years,
-                     cfg.starting_taxable)
+def taxable_brokerage(cfg: SimConfig, annual_override: float | None = None) -> AccountResult:
+    """Post-tax contributions; LTCG applied to all gains at withdrawal."""
+    annual = annual_override if annual_override is not None else 0.0
+    path = _compound(annual, cfg.annual_growth_rate, cfg.years, cfg.starting_taxable)
     effective = []
     for year, bal in enumerate(path):
-        cost_basis = cfg.starting_taxable + cfg.taxable_annual * year
+        cost_basis = cfg.starting_taxable + annual * year
         gains = max(bal - cost_basis, 0.0)
         effective.append(bal - gains * cfg.capital_gains_rate)
     return AccountResult(
         name="Taxable brokerage",
-        annual_contribution=cfg.taxable_annual,
+        annual_contribution=annual,
         pretax_balance=path,
         effective_balance=effective,
     )
@@ -172,12 +206,9 @@ def taxable_brokerage(cfg: SimConfig) -> AccountResult:
 def private_stock(cfg: SimConfig) -> AccountResult:
     """Privately held equity: grows at user-supplied rate, no new contributions.
 
-    Effective balance applies LTCG on accrued gains, consistent with a
-    liquidation event. The growth rate is the user's own assumption —
-    treat it as a real (inflation-adjusted) or nominal rate as appropriate.
+    Effective balance applies LTCG on accrued gains at a future liquidity event.
     """
-    path = _compound(0.0, cfg.private_stock_growth, cfg.years,
-                     cfg.private_stock_value)
+    path = _compound(0.0, cfg.private_stock_growth, cfg.years, cfg.private_stock_value)
     effective = []
     for bal in path:
         gains = max(bal - cfg.private_stock_value, 0.0)
@@ -192,14 +223,38 @@ def private_stock(cfg: SimConfig) -> AccountResult:
 
 # ---------- Public API ----------
 
-ACCOUNT_NAMES = [
-    "Traditional 401(k)",
-    "Roth 401(k)",
-    "Traditional IRA",
-    "Roth IRA",
-]
+def run_portfolio_auto(cfg: SimConfig) -> Tuple[List[AccountResult], Dict[str, float]]:
+    """Auto-allocate gross_devoted in tax-efficiency order and return portfolio results.
 
-_ACCOUNT_FN = {
+    Returns (results, allocation) where allocation is the dict from allocate().
+    """
+    alloc = allocate(cfg)
+    results: List[AccountResult] = []
+
+    # Traditional 401(k)
+    if alloc["trad_401k"] > 0 or cfg.starting_trad_401k > 0:
+        results.append(traditional_401k(cfg, annual_override=alloc["trad_401k"]))
+
+    # HSA
+    if cfg.include_hsa and (alloc["hsa"] > 0 or cfg.starting_hsa > 0):
+        results.append(hsa(cfg, annual_override=alloc["hsa"]))
+
+    # Roth IRA
+    if alloc["roth_ira"] > 0 or cfg.starting_roth_ira > 0:
+        results.append(roth_ira(cfg, annual_override=alloc["roth_ira"]))
+
+    # Taxable brokerage (overflow)
+    if alloc["taxable"] > 0 or cfg.starting_taxable > 0:
+        results.append(taxable_brokerage(cfg, annual_override=alloc["taxable"]))
+
+    # Private stock
+    if cfg.private_stock_value > 0:
+        results.append(private_stock(cfg))
+
+    return results, alloc
+
+
+_COMPARISON_FNS = {
     "Traditional 401(k)": traditional_401k,
     "Roth 401(k)": roth_401k,
     "Traditional IRA": traditional_ira,
@@ -208,25 +263,10 @@ _ACCOUNT_FN = {
 
 
 def run_comparison(cfg: SimConfig) -> List[AccountResult]:
-    """All four tax-advantaged types — used for the comparison view.
+    """Project all four tax-advantaged types independently for side-by-side comparison.
 
-    Starting balances from cfg are included so the projections reflect
-    the user's actual situation rather than a clean-slate hypothetical.
+    Each account receives the full gross_devoted as if it were the only account,
+    for a fair apples-to-apples view. Starting balances are included so projections
+    reflect the user's actual situation.
     """
-    return [fn(cfg) for fn in _ACCOUNT_FN.values()]
-
-
-def run_portfolio(cfg: SimConfig, primary_account: str) -> List[AccountResult]:
-    """The user's actual portfolio: one primary tax-advantaged account plus
-    any taxable brokerage and private stock they have.
-
-    Used for the progress bar and stacked area chart.
-    """
-    results: List[AccountResult] = [_ACCOUNT_FN[primary_account](cfg)]
-    if cfg.include_hsa:
-        results.append(hsa(cfg))
-    if cfg.taxable_annual > 0 or cfg.starting_taxable > 0:
-        results.append(taxable_brokerage(cfg))
-    if cfg.private_stock_value > 0:
-        results.append(private_stock(cfg))
-    return results
+    return [fn(cfg) for fn in _COMPARISON_FNS.values()]
