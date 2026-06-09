@@ -101,7 +101,10 @@ for _k, _v in _DEFAULTS.items():
 
 # ---------- Login gate ----------
 
-_signed_in = st.user.is_logged_in
+# st.user.is_logged_in only exists when [auth] is configured in Streamlit Secrets.
+# If secrets aren't set up yet, treat everyone as a guest so the app still loads.
+_auth_configured = "auth" in st.secrets
+_signed_in = _auth_configured and st.user.is_logged_in
 _guest = st.session_state.get("guest_mode", False)
 
 if not _signed_in and not _guest:
@@ -136,7 +139,13 @@ the current session, just won't be remembered next time.
             )
 
         st.divider()
-        st.login("google")
+        if _auth_configured:
+            st.login("google")
+        else:
+            st.info(
+                "Google sign-in isn't configured yet. "
+                "See the README for setup instructions, or continue as a guest below."
+            )
         st.button(
             "Continue without signing in",
             on_click=lambda: st.session_state.update({"guest_mode": True}),
@@ -164,7 +173,7 @@ with st.sidebar:
         st.button("Sign out", on_click=st.logout, use_container_width=True)
     else:
         st.caption("👤 Using as guest — inputs won't be saved.")
-        if st.button("Sign in with Google", use_container_width=True):
+        if _auth_configured and st.button("Sign in with Google", use_container_width=True):
             st.session_state.pop("guest_mode", None)
             st.rerun()
 
