@@ -28,15 +28,44 @@ st.set_page_config(
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _CREDENTIALS_PATH = os.path.join(_DIR, "auth_config.yaml")
-_DATA_DIR = os.path.join(_DIR, "data")
+
+# On Streamlit Cloud the repo is read-only and auth_config.yaml is gitignored,
+# so it won't exist. Detect this once and switch to secrets-based config.
+_IS_CLOUD = not os.path.exists(_CREDENTIALS_PATH)
+
+# User settings: local → project data/ dir; cloud → /tmp (writable, semi-persistent)
+_DATA_DIR = "/tmp/fire_dashboard_data" if _IS_CLOUD else os.path.join(_DIR, "data")
 
 
 def _load_config() -> dict:
+    """Load auth config from st.secrets (Cloud) or local YAML file (local)."""
+    if _IS_CLOUD:
+        # Credentials and cookie config must be set in the Streamlit Cloud
+        # dashboard under App settings → Secrets. See README for the format.
+        creds: dict = {"usernames": {}}
+        if "credentials" in st.secrets:
+            for uname, udata in st.secrets["credentials"]["usernames"].items():
+                creds["usernames"][uname] = {
+                    "name": udata.get("name", uname),
+                    "email": udata.get("email", ""),
+                    "password": udata["password"],
+                }
+        return {
+            "credentials": creds,
+            "cookie": {
+                "name": st.secrets["cookie"]["name"],
+                "key": st.secrets["cookie"]["key"],
+                "expiry_days": int(st.secrets["cookie"]["expiry_days"]),
+            },
+        }
     with open(_CREDENTIALS_PATH) as f:
         return yaml.safe_load(f)
 
 
 def _save_config(config: dict):
+    """Persist updated credentials. No-op on Cloud (secrets are read-only)."""
+    if _IS_CLOUD:
+        return
     with open(_CREDENTIALS_PATH, "w") as f:
         yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
 
@@ -117,22 +146,29 @@ with st.sidebar:
                 if st.session_state.get("authentication_status") is False:
                     st.error("Incorrect username or password.")
             with tab_register:
-                st.caption("Create an account to save your inputs between sessions.")
-                try:
-                    email, reg_username, reg_name = authenticator.register_user(
-                        location="main",
-                        captcha=False,
-                        pre_authorized=None,
-                        clear_on_submit=True,
+                if _IS_CLOUD:
+                    st.info(
+                        "Self-registration isn't available in the deployed version. "
+                        "Add your credentials via the Streamlit Cloud dashboard "
+                        "(App settings → Secrets). See the README for the format."
                     )
-                    if email:
-                        config["credentials"] = authenticator.credentials
-                        _save_config(config)
-                        st.success(f"Account created for **{reg_name}**. Log in above.")
-                except stauth.RegisterError as e:
-                    st.error(e)
-                except Exception as e:
-                    st.error(f"Registration error: {e}")
+                else:
+                    st.caption("Create an account to save your inputs between sessions.")
+                    try:
+                        email, reg_username, reg_name = authenticator.register_user(
+                            location="main",
+                            captcha=False,
+                            pre_authorized=None,
+                            clear_on_submit=True,
+                        )
+                        if email:
+                            config["credentials"] = authenticator.credentials
+                            _save_config(config)
+                            st.success(f"Account created for **{reg_name}**. Log in above.")
+                    except stauth.RegisterError as e:
+                        st.error(e)
+                    except Exception as e:
+                        st.error(f"Registration error: {e}")
 
     st.divider()
     st.header("Your inputs")

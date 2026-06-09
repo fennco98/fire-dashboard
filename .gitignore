@@ -1,6 +1,7 @@
 # Auth credentials and per-user saved settings — never commit these
 auth_config.yaml
 data/
+.streamlit/secrets.toml
 
 # Python
 __pycache__/
