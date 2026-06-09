@@ -8,8 +8,11 @@ import json
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_local_storage import LocalStorage
 
 from fire_sim import SimConfig, run_comparison, run_portfolio_auto
+
+_STORAGE_KEY = "fire_dashboard_settings"
 
 
 # ---------- Page setup (must be first Streamlit call) ----------
@@ -50,13 +53,45 @@ for _k, _v in _DEFAULTS.items():
         st.session_state[_k] = _v
 
 
+# ---------- Browser local storage (auto save / restore) ----------
+
+# The component constructor blocks until the browser has reported its stored
+# values, so by the time it returns we can read them synchronously. Settings
+# live only in this browser's localStorage — never on the server.
+local_storage = LocalStorage()
+
+if not st.session_state.get("_ls_applied"):
+    _raw = local_storage.getItem(_STORAGE_KEY)
+    if _raw:
+        try:
+            _saved = json.loads(_raw) if isinstance(_raw, str) else _raw
+            for _k, _v in _saved.items():
+                if _k in _DEFAULTS:
+                    st.session_state[_k] = _v
+        except Exception:
+            pass
+    # Mark as applied even if nothing was stored, so we never clobber the
+    # user's in-session edits on a later rerun.
+    st.session_state["_ls_applied"] = True
+
+
+def _persist_to_browser():
+    """Write current settings to browser localStorage if they changed."""
+    current = {k: st.session_state[k] for k in _DEFAULTS}
+    serialized = json.dumps(current, sort_keys=True)
+    if serialized != st.session_state.get("_ls_last_written"):
+        local_storage.setItem(_STORAGE_KEY, serialized, key="ls_save")
+        st.session_state["_ls_last_written"] = serialized
+
+
 # ---------- Sidebar ----------
 
 with st.sidebar:
     st.header("Save / restore")
     st.caption(
-        "Your data stays on your computer — nothing is uploaded or stored "
-        "on the server."
+        "Your inputs are remembered automatically in this browser. "
+        "Nothing is uploaded or stored on the server. Use the file options "
+        "below to back them up or move them to another device."
     )
     uploaded = st.file_uploader(
         "Restore from a saved file", type="json", key="settings_upload",
@@ -156,6 +191,10 @@ with st.sidebar:
         help="Saves your current inputs to a file on your computer. "
              "Upload it later to restore them.",
     )
+
+
+# Auto-save the current inputs to this browser's local storage.
+_persist_to_browser()
 
 
 # ---------- Build config & run ----------
