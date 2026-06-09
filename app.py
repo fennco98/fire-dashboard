@@ -3,16 +3,11 @@
 Run with:  streamlit run app.py
 """
 
-import base64
 import json
-import os
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from cryptography.fernet import Fernet
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from fire_sim import SimConfig, run_comparison, run_portfolio_auto
 
@@ -24,50 +19,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-
-# ---------- Storage helpers ----------
-
-_DIR = os.path.dirname(os.path.abspath(__file__))
-# Streamlit Cloud serves from /mount/src/; that subtree is read-only.
-# Fall back to /tmp which is writable (and semi-persistent within a deployment).
-_IS_CLOUD = _DIR.startswith("/mount/src/")
-_DATA_DIR = "/tmp/fire_dashboard_data" if _IS_CLOUD else os.path.join(_DIR, "data")
-
-
-def _fernet(user_sub: str) -> Fernet:
-    """Derive a Fernet key from the user's stable Google account ID.
-
-    The key is computed at runtime from the sub claim (present only during
-    an active authenticated session) and never stored anywhere. Once a
-    session ends, the server has no way to reconstruct the key — meaning
-    the encrypted files on disk are unreadable without the user signing in.
-    """
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=b"fire_dashboard_v1",
-        iterations=200_000,
-    )
-    return Fernet(base64.urlsafe_b64encode(kdf.derive(user_sub.encode())))
-
-
-def _load_settings(user_sub: str) -> dict:
-    path = os.path.join(_DATA_DIR, f"{user_sub}.enc")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "rb") as f:
-            return json.loads(_fernet(user_sub).decrypt(f.read()))
-    except Exception:
-        return {}
-
-
-def _save_settings(user_sub: str, settings: dict):
-    os.makedirs(_DATA_DIR, exist_ok=True)
-    data = _fernet(user_sub).encrypt(json.dumps(settings).encode())
-    with open(os.path.join(_DATA_DIR, f"{user_sub}.enc"), "wb") as f:
-        f.write(data)
 
 
 # ---------- Defaults ----------
@@ -99,83 +50,28 @@ for _k, _v in _DEFAULTS.items():
         st.session_state[_k] = _v
 
 
-# ---------- Login gate ----------
-
-# st.user.is_logged_in only exists when [auth] is configured in Streamlit Secrets.
-# If secrets aren't set up yet, treat everyone as a guest so the app still loads.
-_auth_configured = "auth" in st.secrets
-_signed_in = _auth_configured and st.user.is_logged_in
-_guest = st.session_state.get("guest_mode", False)
-
-if not _signed_in and not _guest:
-    _, col, _ = st.columns([1, 2, 1])
-    with col:
-        st.title("🔥 FIRE Dashboard")
-        st.markdown("Track your path to financial independence.")
-        st.divider()
-
-        with st.container(border=True):
-            st.markdown("#### 🔒 Your data stays yours")
-            st.markdown(
-                """
-Signing in with Google lets you save and restore your inputs across sessions.
-Here's exactly what that means for your privacy:
-
-- **End-to-end encryption.** Your saved inputs are encrypted using a key
-  derived from your unique Google account ID — a key that only exists in
-  memory while you're actively signed in. Once you sign out, that key is
-  gone. The encrypted file on disk is unreadable without you signing back in.
-- **We cannot read your data.** Because the encryption key is never stored —
-  only derived on demand from your live session — even the operator of this
-  app has no way to decrypt your saved inputs.
-- **No passwords stored.** Sign-in is handled entirely by Google. We never
-  see or store your Google password.
-- **Minimal data.** We store nothing except the encrypted blob of inputs you
-  explicitly save. No name, no email, no usage logs.
-
-You can also use the app without signing in — your inputs will work fine for
-the current session, just won't be remembered next time.
-                """
-            )
-
-        st.divider()
-        if _auth_configured:
-            st.login("google")
-        else:
-            st.info(
-                "Google sign-in isn't configured yet. "
-                "See the README for setup instructions, or continue as a guest below."
-            )
-        st.button(
-            "Continue without signing in",
-            on_click=lambda: st.session_state.update({"guest_mode": True}),
-            use_container_width=True,
-            type="secondary",
-        )
-    st.stop()
-
-
-# ---------- Load saved settings on first sign-in ----------
-
-if _signed_in:
-    _sub = st.user.sub
-    if _sub != st.session_state.get("_loaded_for"):
-        for k, v in _load_settings(_sub).items():
-            st.session_state[k] = v
-        st.session_state["_loaded_for"] = _sub
-
-
 # ---------- Sidebar ----------
 
 with st.sidebar:
-    if _signed_in:
-        st.write(f"👤 **{st.user.name}**")
-        st.button("Sign out", on_click=st.logout, use_container_width=True)
-    else:
-        st.caption("👤 Using as guest — inputs won't be saved.")
-        if _auth_configured and st.button("Sign in with Google", use_container_width=True):
-            st.session_state.pop("guest_mode", None)
+    st.header("Save / restore")
+    st.caption(
+        "Your data stays on your computer — nothing is uploaded or stored "
+        "on the server."
+    )
+    uploaded = st.file_uploader(
+        "Restore from a saved file", type="json", key="settings_upload",
+        help="Load a fire-settings.json you previously downloaded.",
+    )
+    if uploaded is not None and uploaded.file_id != st.session_state.get("_applied_upload"):
+        try:
+            data = json.load(uploaded)
+            for k in _DEFAULTS:
+                if k in data:
+                    st.session_state[k] = data[k]
+            st.session_state["_applied_upload"] = uploaded.file_id
             st.rerun()
+        except Exception as e:
+            st.error(f"Couldn't read that file: {e}")
 
     st.divider()
     st.header("Your inputs")
@@ -250,11 +146,16 @@ with st.sidebar:
     limit_hsa = st.number_input(
         "HSA limit ($)", step=100, key="limit_hsa", disabled=not include_hsa)
 
-    if _signed_in:
-        st.divider()
-        if st.button("💾 Save my settings", use_container_width=True):
-            _save_settings(st.user.sub, {k: st.session_state[k] for k in _DEFAULTS})
-            st.success("Settings saved!")
+    st.divider()
+    st.download_button(
+        "💾 Download my settings",
+        data=json.dumps({k: st.session_state[k] for k in _DEFAULTS}, indent=2),
+        file_name="fire-settings.json",
+        mime="application/json",
+        use_container_width=True,
+        help="Saves your current inputs to a file on your computer. "
+             "Upload it later to restore them.",
+    )
 
 
 # ---------- Build config & run ----------

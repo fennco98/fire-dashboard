@@ -41,34 +41,18 @@ All inputs are in the sidebar: contribution amounts, current account balances, t
 
 ---
 
+## Saving your inputs
+
+There's no account or login. To keep your numbers between sessions:
+
+- **💾 Download my settings** (bottom of the sidebar) saves your current inputs to a `fire-settings.json` file on your own computer.
+- **Restore from a saved file** (top of the sidebar) loads that file back in.
+
+Your data never touches the server — it lives only as a file on your machine, so there's nothing to keep private server-side.
+
 ## Deploying to Streamlit Community Cloud
 
-Sign-in uses Google OAuth via Streamlit's native `st.login()`. One-time setup:
-
-1. Go to [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Credentials → **Create OAuth 2.0 Client ID** (Web app type)
-   - Add your app URL as an authorised redirect URI: `https://your-app.streamlit.app/oauth2callback`
-   - Also add `http://localhost:8501/oauth2callback` for local dev
-
-2. Deploy the repo at [share.streamlit.io](https://share.streamlit.io) pointing at `app.py`
-
-3. Open **App settings → Secrets** and paste:
-
-```toml
-[auth]
-redirect_uri = "https://your-app.streamlit.app/oauth2callback"
-cookie_secret = "your-random-secret"   # python3 -c "import secrets; print(secrets.token_hex(32))"
-
-[auth.google]
-client_id = "your-client-id.apps.googleusercontent.com"
-client_secret = "your-client-secret"
-server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
-```
-
-4. Save and reboot — done. Anyone with a Google account can now sign in; no passwords to manage.
-
-For local development, copy the same block into `.streamlit/secrets.toml` (gitignored) with `redirect_uri = "http://localhost:8501/oauth2callback"`.
-
-> **Saved settings** persist as long as the Cloud container is running and reset on redeploy — a Streamlit Cloud limitation. Sign-in is always optional; the app works fully without it.
+Deploy the repo at [share.streamlit.io](https://share.streamlit.io) pointing at `app.py`. No secrets or configuration required.
 
 ---
 
