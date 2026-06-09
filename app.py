@@ -56,7 +56,7 @@ def _save_user_settings(username: str, settings: dict):
         json.dump(settings, f, indent=2)
 
 
-# ---------- Auth gate ----------
+# ---------- Auth setup ----------
 
 config = _load_config()
 authenticator = stauth.Authenticate(
@@ -67,79 +67,72 @@ authenticator = stauth.Authenticate(
     auto_hash=True,
 )
 
-if not st.session_state.get("authentication_status"):
-    st.title("FIRE dashboard")
-    tab_login, tab_register = st.tabs(["Log in", "Create account"])
+# Seed widget defaults on very first load (before any auth)
+_DEFAULTS = {
+    "gross_devoted": 25_000,
+    "years": 30,
+    "growth_rate_pct": 7.0,
+    "marginal_now_pct": 24.0,
+    "marginal_retire_pct": 22.0,
+    "cap_gains_pct": 15.0,
+    "starting_trad_401k": 0,
+    "starting_roth_401k": 0,
+    "starting_trad_ira": 0,
+    "starting_roth_ira": 0,
+    "starting_taxable": 0,
+    "private_stock_value": 0,
+    "private_stock_growth_pct": 15.0,
+    "fire_target": 2_000_000,
+    "limit_401k": 23_500,
+    "limit_ira": 7_000,
+    "include_hsa": False,
+    "starting_hsa": 0,
+    "limit_hsa": 4_300,
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-    with tab_login:
-        authenticator.login(location="main", clear_on_submit=True)
-        status = st.session_state.get("authentication_status")
-        if status is False:
-            st.error("Incorrect username or password.")
-        elif status is None:
-            st.info("Enter your credentials to continue.")
-
-    with tab_register:
-        st.write("Create a new account to save your inputs between sessions.")
-        try:
-            email, reg_username, reg_name = authenticator.register_user(
-                location="main",
-                captcha=False,
-                pre_authorized=None,
-                clear_on_submit=True,
-            )
-            if email:
-                # Persist the new credentials (auto_hash=True has already hashed the pw)
-                config["credentials"] = authenticator.credentials
-                _save_config(config)
-                st.success(f"Account created for **{reg_name}**. Switch to the Log in tab.")
-        except stauth.RegisterError as e:
-            st.error(e)
-        except Exception as e:
-            st.error(f"Registration error: {e}")
-
-    st.stop()
-
-
-# ---------- Logged in — load saved settings once per session ----------
-
-username: str = st.session_state["username"]
-display_name: str = st.session_state["name"]
-
-if "settings_loaded" not in st.session_state:
-    saved = _load_user_settings(username)
-    # Seed session state so widgets pick up saved values on first render
-    defaults = {
-        "gross_devoted": 25_000,
-        "years": 30,
-        "growth_rate_pct": 7.0,
-        "marginal_now_pct": 24.0,
-        "marginal_retire_pct": 22.0,
-        "cap_gains_pct": 15.0,
-        "starting_trad_401k": 0,
-        "starting_roth_401k": 0,
-        "starting_trad_ira": 0,
-        "starting_roth_ira": 0,
-        "starting_taxable": 0,
-        "private_stock_value": 0,
-        "private_stock_growth_pct": 15.0,
-        "fire_target": 2_000_000,
-        "limit_401k": 23_500,
-        "limit_ira": 7_000,
-        "include_hsa": False,
-        "starting_hsa": 0,
-        "limit_hsa": 4_300,
-    }
-    for key, default in defaults.items():
-        st.session_state[key] = saved.get(key, default)
-    st.session_state["settings_loaded"] = True
+# When a user logs in, load their saved settings (once per login)
+_logged_in = st.session_state.get("authentication_status") is True
+_active_user = st.session_state.get("username")
+if _logged_in and _active_user != st.session_state.get("_settings_loaded_for"):
+    saved = _load_user_settings(_active_user)
+    for k, v in saved.items():
+        st.session_state[k] = v
+    st.session_state["_settings_loaded_for"] = _active_user
 
 
 # ---------- Sidebar ----------
 
 with st.sidebar:
-    st.write(f"👤 **{display_name}**")
-    authenticator.logout(button_name="Log out", location="sidebar")
+    if _logged_in:
+        st.write(f"👤 **{st.session_state['name']}**")
+        authenticator.logout(button_name="Log out", location="sidebar")
+    else:
+        with st.expander("🔐 Log in / Create account"):
+            tab_login, tab_register = st.tabs(["Log in", "Create account"])
+            with tab_login:
+                authenticator.login(location="main", clear_on_submit=True)
+                if st.session_state.get("authentication_status") is False:
+                    st.error("Incorrect username or password.")
+            with tab_register:
+                st.caption("Create an account to save your inputs between sessions.")
+                try:
+                    email, reg_username, reg_name = authenticator.register_user(
+                        location="main",
+                        captcha=False,
+                        pre_authorized=None,
+                        clear_on_submit=True,
+                    )
+                    if email:
+                        config["credentials"] = authenticator.credentials
+                        _save_config(config)
+                        st.success(f"Account created for **{reg_name}**. Log in above.")
+                except stauth.RegisterError as e:
+                    st.error(e)
+                except Exception as e:
+                    st.error(f"Registration error: {e}")
 
     st.divider()
     st.header("Your inputs")
@@ -215,8 +208,8 @@ with st.sidebar:
         "HSA limit ($)", step=100, key="limit_hsa", disabled=not include_hsa)
 
     st.divider()
-    if st.button("💾 Save my settings", use_container_width=True):
-        _save_user_settings(username, {
+    if _logged_in and st.button("💾 Save my settings", use_container_width=True):
+        _save_user_settings(_active_user, {
             "gross_devoted": st.session_state.gross_devoted,
             "years": st.session_state.years,
             "growth_rate_pct": st.session_state.growth_rate_pct,
