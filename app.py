@@ -3,14 +3,19 @@
 Run with:  streamlit run app.py
 """
 
+import json
+import os
+
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yaml
+import streamlit_authenticator as stauth
 
 from fire_sim import SimConfig, run_comparison, run_portfolio_auto
 
 
-# ---------- Page setup ----------
+# ---------- Page setup (must be first Streamlit call) ----------
 
 st.set_page_config(
     page_title="FIRE dashboard",
@@ -19,88 +24,220 @@ st.set_page_config(
 )
 
 
+# ---------- Auth helpers ----------
+
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_CREDENTIALS_PATH = os.path.join(_DIR, "auth_config.yaml")
+_DATA_DIR = os.path.join(_DIR, "data")
+
+
+def _load_config() -> dict:
+    with open(_CREDENTIALS_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def _save_config(config: dict):
+    with open(_CREDENTIALS_PATH, "w") as f:
+        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+
+
+def _load_user_settings(username: str) -> dict:
+    path = os.path.join(_DATA_DIR, f"{username}.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_user_settings(username: str, settings: dict):
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    path = os.path.join(_DATA_DIR, f"{username}.json")
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=2)
+
+
+# ---------- Auth gate ----------
+
+config = _load_config()
+authenticator = stauth.Authenticate(
+    config["credentials"],
+    config["cookie"]["name"],
+    config["cookie"]["key"],
+    config["cookie"]["expiry_days"],
+    auto_hash=True,
+)
+
+if not st.session_state.get("authentication_status"):
+    st.title("FIRE dashboard")
+    tab_login, tab_register = st.tabs(["Log in", "Create account"])
+
+    with tab_login:
+        authenticator.login(location="main", clear_on_submit=True)
+        status = st.session_state.get("authentication_status")
+        if status is False:
+            st.error("Incorrect username or password.")
+        elif status is None:
+            st.info("Enter your credentials to continue.")
+
+    with tab_register:
+        st.write("Create a new account to save your inputs between sessions.")
+        try:
+            email, reg_username, reg_name = authenticator.register_user(
+                location="main",
+                captcha=False,
+                pre_authorized=None,
+                clear_on_submit=True,
+            )
+            if email:
+                # Persist the new credentials (auto_hash=True has already hashed the pw)
+                config["credentials"] = authenticator.credentials
+                _save_config(config)
+                st.success(f"Account created for **{reg_name}**. Switch to the Log in tab.")
+        except stauth.RegisterError as e:
+            st.error(e)
+        except Exception as e:
+            st.error(f"Registration error: {e}")
+
+    st.stop()
+
+
+# ---------- Logged in — load saved settings once per session ----------
+
+username: str = st.session_state["username"]
+display_name: str = st.session_state["name"]
+
+if "settings_loaded" not in st.session_state:
+    saved = _load_user_settings(username)
+    # Seed session state so widgets pick up saved values on first render
+    defaults = {
+        "gross_devoted": 25_000,
+        "years": 30,
+        "growth_rate_pct": 7.0,
+        "marginal_now_pct": 24.0,
+        "marginal_retire_pct": 22.0,
+        "cap_gains_pct": 15.0,
+        "starting_trad_401k": 0,
+        "starting_roth_401k": 0,
+        "starting_trad_ira": 0,
+        "starting_roth_ira": 0,
+        "starting_taxable": 0,
+        "private_stock_value": 0,
+        "private_stock_growth_pct": 15.0,
+        "fire_target": 2_000_000,
+        "limit_401k": 23_500,
+        "limit_ira": 7_000,
+        "include_hsa": False,
+        "starting_hsa": 0,
+        "limit_hsa": 4_300,
+    }
+    for key, default in defaults.items():
+        st.session_state[key] = saved.get(key, default)
+    st.session_state["settings_loaded"] = True
+
+
 # ---------- Sidebar ----------
 
 with st.sidebar:
+    st.write(f"👤 **{display_name}**")
+    authenticator.logout(button_name="Log out", location="sidebar")
+
+    st.divider()
     st.header("Your inputs")
 
     st.subheader("Contributions & timeline")
     gross_devoted = st.number_input(
         "Annual gross income to invest ($)",
-        min_value=0, value=25_000, step=1_000,
-        help="Pre-tax dollars devoted to retirement per year. The simulator "
-             "handles tax timing for each account type.",
+        min_value=0, step=1_000, key="gross_devoted",
+        help="Pre-tax dollars devoted to retirement per year. Auto-allocated: "
+             "401(k) first, then Roth IRA, then taxable overflow.",
     )
-    years = st.slider("Years until retirement", 1, 50, 30)
+    years = st.slider("Years until retirement", 1, 50, key="years")
     growth_rate = st.slider(
-        "Annual nominal return (%)", 0.0, 15.0, 7.0, 0.5,
-        help="~10% historical US stock nominal return; ~7% if you want results "
-             "in today's dollars (real return).",
+        "Annual nominal return (%)", 0.0, 15.0, step=0.5, key="growth_rate_pct",
+        help="~10% historical US stock nominal return; ~7% real (inflation-adjusted).",
     ) / 100
 
     st.subheader("Tax rates")
-    marginal_now = st.slider("Marginal rate today (%)", 0.0, 50.0, 24.0, 0.5) / 100
+    marginal_now = st.slider(
+        "Marginal rate today (%)", 0.0, 50.0, step=0.5, key="marginal_now_pct") / 100
     marginal_retire = st.slider(
-        "Marginal rate at withdrawal (%)", 0.0, 50.0, 22.0, 0.5,
+        "Marginal rate at withdrawal (%)", 0.0, 50.0, step=0.5, key="marginal_retire_pct",
         help="Set lower than today if you expect less income in retirement.",
     ) / 100
     cap_gains_rate = st.slider(
-        "Long-term capital gains rate (%)", 0.0, 25.0, 15.0, 0.5,
-        help="Applied to gains in the taxable brokerage and private stock "
-             "at the point of withdrawal/sale.",
+        "Long-term capital gains rate (%)", 0.0, 25.0, step=0.5, key="cap_gains_pct",
+        help="Applied to taxable brokerage and private stock gains at sale.",
     ) / 100
 
     st.subheader("Current account balances")
     starting_trad_401k = st.number_input(
-        "Traditional 401(k) balance ($)", min_value=0, value=0, step=1_000)
+        "Traditional 401(k) ($)", min_value=0, step=1_000, key="starting_trad_401k")
     starting_roth_401k = st.number_input(
-        "Roth 401(k) balance ($)", min_value=0, value=0, step=1_000)
+        "Roth 401(k) ($)", min_value=0, step=1_000, key="starting_roth_401k")
     starting_trad_ira = st.number_input(
-        "Traditional IRA balance ($)", min_value=0, value=0, step=1_000)
+        "Traditional IRA ($)", min_value=0, step=1_000, key="starting_trad_ira")
     starting_roth_ira = st.number_input(
-        "Roth IRA balance ($)", min_value=0, value=0, step=1_000)
+        "Roth IRA ($)", min_value=0, step=1_000, key="starting_roth_ira")
 
     st.subheader("Taxable brokerage")
     starting_taxable = st.number_input(
-        "Current balance ($)", min_value=0, value=0, step=1_000,
-        help="Any overflow from the annual gross devoted — after maxing "
-             "the 401(k) and Roth IRA — spills into this account automatically.",
-        key="taxable_start")
+        "Current balance ($)", min_value=0, step=1_000, key="starting_taxable",
+        help="Overflow from the annual gross devoted spills here automatically.",
+    )
 
     st.subheader("Private stock / equity")
     private_stock_value = st.number_input(
-        "Current value ($)", min_value=0, value=0, step=10_000)
+        "Current value ($)", min_value=0, step=10_000, key="private_stock_value")
     private_stock_growth = st.slider(
-        "Expected annual growth (%)", 0.0, 50.0, 15.0, 0.5,
-        help="Your own assumption for this holding. "
-             "Input as real or nominal — just be consistent with the "
-             "nominal return slider above.",
+        "Expected annual growth (%)", 0.0, 50.0, step=0.5, key="private_stock_growth_pct",
+        help="Your own assumption. Real or nominal — be consistent with the return slider.",
     ) / 100
 
     st.subheader("FIRE target")
     fire_target = st.number_input(
         "Target retirement portfolio ($)",
-        min_value=0, value=2_000_000, step=100_000,
-        help="Common starting point: 25× your annual expenses (4% rule). "
-             "Adjust to your situation.",
+        min_value=0, step=100_000, key="fire_target",
+        help="Common starting point: 25× annual expenses (4% rule).",
     )
 
     st.subheader("Account limits")
-    limit_401k = st.number_input("401(k) employee limit ($)", value=23_500, step=500)
-    limit_ira = st.number_input("IRA limit ($)", value=7_000, step=500)
+    limit_401k = st.number_input(
+        "401(k) employee limit ($)", step=500, key="limit_401k")
+    limit_ira = st.number_input("IRA limit ($)", step=500, key="limit_ira")
 
     st.subheader("Optional")
-    include_hsa = st.checkbox(
-        "Include HSA",
-        value=False,
-        help="Triple-tax-free if spent on qualified medical expenses. "
-             "Requires a high-deductible health plan.",
-    )
+    include_hsa = st.checkbox("Include HSA", key="include_hsa",
+        help="Triple-tax-free for qualified medical expenses. Requires HDHP.")
     starting_hsa = st.number_input(
-        "HSA current balance ($)", min_value=0, value=0, step=500,
+        "HSA current balance ($)", min_value=0, step=500, key="starting_hsa",
         disabled=not include_hsa)
     limit_hsa = st.number_input(
-        "HSA limit ($)", value=4_300, step=100, disabled=not include_hsa)
+        "HSA limit ($)", step=100, key="limit_hsa", disabled=not include_hsa)
+
+    st.divider()
+    if st.button("💾 Save my settings", use_container_width=True):
+        _save_user_settings(username, {
+            "gross_devoted": st.session_state.gross_devoted,
+            "years": st.session_state.years,
+            "growth_rate_pct": st.session_state.growth_rate_pct,
+            "marginal_now_pct": st.session_state.marginal_now_pct,
+            "marginal_retire_pct": st.session_state.marginal_retire_pct,
+            "cap_gains_pct": st.session_state.cap_gains_pct,
+            "starting_trad_401k": st.session_state.starting_trad_401k,
+            "starting_roth_401k": st.session_state.starting_roth_401k,
+            "starting_trad_ira": st.session_state.starting_trad_ira,
+            "starting_roth_ira": st.session_state.starting_roth_ira,
+            "starting_taxable": st.session_state.starting_taxable,
+            "private_stock_value": st.session_state.private_stock_value,
+            "private_stock_growth_pct": st.session_state.private_stock_growth_pct,
+            "fire_target": st.session_state.fire_target,
+            "limit_401k": st.session_state.limit_401k,
+            "limit_ira": st.session_state.limit_ira,
+            "include_hsa": st.session_state.include_hsa,
+            "starting_hsa": st.session_state.starting_hsa,
+            "limit_hsa": st.session_state.limit_hsa,
+        })
+        st.success("Settings saved!")
 
 
 # ---------- Build config & run ----------
@@ -166,11 +303,8 @@ else:
         f"({1 - progress_proj:.1%} of target remaining)."
     )
 
-# Allocation breakdown
 with st.expander("Annual contribution breakdown"):
-    alloc_rows = [
-        ("Traditional 401(k)", alloc["trad_401k"], "Pre-tax"),
-    ]
+    alloc_rows = [("Traditional 401(k)", alloc["trad_401k"], "Pre-tax")]
     if cfg.include_hsa:
         alloc_rows.append(("HSA", alloc["hsa"], "Pre-tax"))
     alloc_rows.append(("Roth IRA", alloc["roth_ira"], "Post-tax"))
@@ -186,7 +320,7 @@ with st.expander("Annual contribution breakdown"):
 st.divider()
 
 
-# ---------- Tabs: portfolio chart vs comparison ----------
+# ---------- Tabs ----------
 
 tab_portfolio, tab_comparison = st.tabs(["Your portfolio", "Account type comparison"])
 
@@ -198,7 +332,7 @@ with tab_portfolio:
         "Stacked area showing how each piece of your portfolio grows. "
         "Annual gross devoted is auto-allocated: 401(k) first, then Roth IRA, "
         "then taxable brokerage with any overflow. "
-        "Balances shown are after estimated withdrawal / capital-gains taxes."
+        "Balances are after estimated withdrawal / capital-gains taxes."
     )
 
     fig_stack = go.Figure()
@@ -230,7 +364,6 @@ with tab_portfolio:
     )
     st.plotly_chart(fig_stack, use_container_width=True)
 
-    # Portfolio table
     df_port = pd.DataFrame([{
         "Account": r.name,
         "Annual contribution": f"${r.annual_contribution:,.0f}",
@@ -250,9 +383,9 @@ with tab_portfolio:
 with tab_comparison:
     st.subheader("Tax-advantaged account type comparison")
     st.caption(
-        "Compares the four account types using your inputs, including current "
-        "balances. All are fed the same pre-tax gross income; the simulator "
-        "handles tax timing per account."
+        "Projects all four account types independently from the same gross "
+        "income devoted — the fair apples-to-apples view of which strategy "
+        "yields the most given your tax rates and timeline."
     )
 
     comparison = run_comparison(cfg)
@@ -317,14 +450,13 @@ with tab_comparison:
 with st.expander("Assumptions and known limitations"):
     st.markdown(
         """
-- **Portfolio view auto-allocates** gross income devoted in tax-efficiency order: 401(k) → HSA (if enabled) → Roth IRA → taxable brokerage overflow. The comparison tab feeds the full gross amount to each account type independently for side-by-side evaluation.
-- **Returns are constant, nominal, and deterministic.** No inflation adjustment, no volatility, no sequence-of-returns risk. Use ~7% if you want results in today's dollars.
-- **Private stock growth** is your own assumption and may be real or nominal — be consistent with the main return slider.
+- **Portfolio view auto-allocates** gross income devoted in tax-efficiency order: 401(k) → HSA (if enabled) → Roth IRA → taxable brokerage overflow. The comparison tab feeds the full gross amount to each account type independently.
+- **Returns are constant, nominal, and deterministic.** No inflation adjustment, no volatility, no sequence-of-returns risk. Use ~7% for results in today's dollars.
+- **Private stock growth** is your own assumption — real or nominal, just be consistent with the main return slider.
 - **Single tax bracket approximation.** Real brackets are progressive; marginal rate is an approximation.
-- **Roth IRA income phase-outs not modeled.** Above ~$165k single / ~$246k MFJ (2025) you can't contribute directly.
-- **Traditional IRA deductibility not modeled.** If you have a workplace plan and earn above the phase-out, your contributions may be non-deductible.
-- **Capital gains on the taxable brokerage** are modeled as a single liquidation-event tax on all accrued gains at year N. No annual tax drag on dividends or short-term gains.
-- **Private stock effective balance** assumes LTCG applied to all appreciation over current value at a future liquidity event.
+- **Roth IRA income phase-outs not modeled.** Above ~$165k single / ~$246k MFJ (2025).
+- **Traditional IRA deductibility not modeled.** May be non-deductible above certain incomes with a workplace plan.
+- **Capital gains on taxable brokerage** are modeled as a single liquidation-event tax at year N. No annual tax drag.
 - **No RMDs, no early-withdrawal penalties, no Roth conversion ladders, no 72(t).**
         """
     )

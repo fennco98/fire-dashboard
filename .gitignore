@@ -1,0 +1,9 @@
+# Auth credentials and per-user saved settings — never commit these
+auth_config.yaml
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
