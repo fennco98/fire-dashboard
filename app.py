@@ -84,6 +84,29 @@ def _persist_to_browser():
         st.session_state["_ls_last_written"] = serialized
 
 
+def _money_input(label, key, help=None, disabled=False):
+    """Dollar entry box that displays thousands separators (e.g. 25,000).
+
+    The visible text lives in `{key}__disp`; the canonical integer stays in
+    st.session_state[key] so the rest of the app and storage are unaffected.
+    """
+    disp_key = f"{key}__disp"
+    if disp_key not in st.session_state:
+        st.session_state[disp_key] = f"{int(st.session_state[key]):,}"
+
+    def _sync():
+        raw = st.session_state[disp_key].replace(",", "").strip()
+        try:
+            val = max(int(round(float(raw))), 0) if raw else 0
+        except ValueError:
+            val = int(st.session_state[key])  # keep last good value on bad input
+        st.session_state[key] = val
+        st.session_state[disp_key] = f"{val:,}"
+
+    st.text_input(label, key=disp_key, on_change=_sync, help=help, disabled=disabled)
+    return int(st.session_state[key])
+
+
 # ---------- Sidebar ----------
 
 with st.sidebar:
@@ -103,6 +126,8 @@ with st.sidebar:
             for k in _DEFAULTS:
                 if k in data:
                     st.session_state[k] = data[k]
+                    # Drop any cached display string so money boxes refresh.
+                    st.session_state.pop(f"{k}__disp", None)
             st.session_state["_applied_upload"] = uploaded.file_id
             st.rerun()
         except Exception as e:
@@ -112,9 +137,8 @@ with st.sidebar:
     st.header("Your inputs")
 
     st.subheader("Contributions & timeline")
-    gross_devoted = st.number_input(
-        "Annual gross income to invest ($)",
-        min_value=0, step=1_000, key="gross_devoted",
+    gross_devoted = _money_input(
+        "Annual gross income to invest ($)", "gross_devoted",
         help="Pre-tax dollars devoted to retirement per year. Auto-allocated: "
              "401(k) first, then Roth IRA, then taxable overflow.",
     )
@@ -137,49 +161,41 @@ with st.sidebar:
     ) / 100
 
     st.subheader("Current account balances")
-    starting_trad_401k = st.number_input(
-        "Traditional 401(k) ($)", min_value=0, step=1_000, key="starting_trad_401k")
-    starting_roth_401k = st.number_input(
-        "Roth 401(k) ($)", min_value=0, step=1_000, key="starting_roth_401k")
-    starting_trad_ira = st.number_input(
-        "Traditional IRA ($)", min_value=0, step=1_000, key="starting_trad_ira")
-    starting_roth_ira = st.number_input(
-        "Roth IRA ($)", min_value=0, step=1_000, key="starting_roth_ira")
+    starting_trad_401k = _money_input("Traditional 401(k) ($)", "starting_trad_401k")
+    starting_roth_401k = _money_input("Roth 401(k) ($)", "starting_roth_401k")
+    starting_trad_ira = _money_input("Traditional IRA ($)", "starting_trad_ira")
+    starting_roth_ira = _money_input("Roth IRA ($)", "starting_roth_ira")
 
     st.subheader("Taxable brokerage")
-    starting_taxable = st.number_input(
-        "Current balance ($)", min_value=0, step=1_000, key="starting_taxable",
+    starting_taxable = _money_input(
+        "Current balance ($)", "starting_taxable",
         help="Overflow from the annual gross devoted spills here automatically.",
     )
 
     st.subheader("Private stock / equity")
-    private_stock_value = st.number_input(
-        "Current value ($)", min_value=0, step=10_000, key="private_stock_value")
+    private_stock_value = _money_input("Current value ($)", "private_stock_value")
     private_stock_growth = st.slider(
         "Expected annual growth (%)", 0.0, 50.0, step=0.5, key="private_stock_growth_pct",
         help="Your own assumption. Real or nominal — be consistent with the return slider.",
     ) / 100
 
     st.subheader("FIRE target")
-    fire_target = st.number_input(
-        "Target retirement portfolio ($)",
-        min_value=0, step=100_000, key="fire_target",
+    fire_target = _money_input(
+        "Target retirement portfolio ($)", "fire_target",
         help="Common starting point: 25× annual expenses (4% rule).",
     )
 
     st.subheader("Account limits")
-    limit_401k = st.number_input(
-        "401(k) employee limit ($)", step=500, key="limit_401k")
-    limit_ira = st.number_input("IRA limit ($)", step=500, key="limit_ira")
+    limit_401k = _money_input("401(k) employee limit ($)", "limit_401k")
+    limit_ira = _money_input("IRA limit ($)", "limit_ira")
 
     st.subheader("Optional")
     include_hsa = st.checkbox("Include HSA", key="include_hsa",
         help="Triple-tax-free for qualified medical expenses. Requires HDHP.")
-    starting_hsa = st.number_input(
-        "HSA current balance ($)", min_value=0, step=500, key="starting_hsa",
-        disabled=not include_hsa)
-    limit_hsa = st.number_input(
-        "HSA limit ($)", step=100, key="limit_hsa", disabled=not include_hsa)
+    starting_hsa = _money_input(
+        "HSA current balance ($)", "starting_hsa", disabled=not include_hsa)
+    limit_hsa = _money_input(
+        "HSA limit ($)", "limit_hsa", disabled=not include_hsa)
 
     st.divider()
     st.download_button(
