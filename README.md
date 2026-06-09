@@ -43,33 +43,32 @@ All inputs are in the sidebar: contribution amounts, current account balances, t
 
 ## Deploying to Streamlit Community Cloud
 
-The app runs on Streamlit Cloud with one setup step: adding secrets via the dashboard.
+Sign-in uses Google OAuth via Streamlit's native `st.login()`. One-time setup:
 
-1. Deploy the repo at [share.streamlit.io](https://share.streamlit.io) pointing at `app.py`
-2. Open **App settings → Secrets** and paste the following, filling in your values:
+1. Go to [console.cloud.google.com](https://console.cloud.google.com) → APIs & Services → Credentials → **Create OAuth 2.0 Client ID** (Web app type)
+   - Add your app URL as an authorised redirect URI: `https://your-app.streamlit.app/oauth2callback`
+   - Also add `http://localhost:8501/oauth2callback` for local dev
+
+2. Deploy the repo at [share.streamlit.io](https://share.streamlit.io) pointing at `app.py`
+
+3. Open **App settings → Secrets** and paste:
 
 ```toml
-[cookie]
-name = "fire_dashboard"
-key = "your-random-secret-key"   # generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
-expiry_days = 30
+[auth]
+redirect_uri = "https://your-app.streamlit.app/oauth2callback"
+cookie_secret = "your-random-secret"   # python3 -c "import secrets; print(secrets.token_hex(32))"
 
-[credentials.usernames.yourname]
-name = "Your Name"
-email = ""
-password = "$2b$12$..."   # bcrypt hash — see below
+[auth.google]
+client_id = "your-client-id.apps.googleusercontent.com"
+client_secret = "your-client-secret"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
 ```
 
-To hash your password, run locally:
-```bash
-python3 -c "import bcrypt; print(bcrypt.hashpw(b'yourpassword', bcrypt.gensalt()).decode())"
-```
+4. Save and reboot — done. Anyone with a Google account can now sign in; no passwords to manage.
 
-3. Save and reboot the app — done.
+For local development, copy the same block into `.streamlit/secrets.toml` (gitignored) with `redirect_uri = "http://localhost:8501/oauth2callback"`.
 
-> **Self-registration** works locally but is disabled on Cloud (Streamlit Secrets are read-only from app code). Add new users by editing the Secrets in the dashboard.
-
-> **Saved settings** on Cloud persist as long as the app container is running. They'll reset if the app restarts or redeploys — this is a Streamlit Cloud limitation.
+> **Saved settings** persist as long as the Cloud container is running and reset on redeploy — a Streamlit Cloud limitation. Sign-in is always optional; the app works fully without it.
 
 ---
 

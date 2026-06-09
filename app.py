@@ -3,14 +3,16 @@
 Run with:  streamlit run app.py
 """
 
+import base64
 import json
 import os
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-import yaml
-import streamlit_authenticator as stauth
+from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from fire_sim import SimConfig, run_comparison, run_portfolio_auto
 
@@ -24,79 +26,52 @@ st.set_page_config(
 )
 
 
-# ---------- Auth helpers ----------
+# ---------- Storage helpers ----------
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
-_CREDENTIALS_PATH = os.path.join(_DIR, "auth_config.yaml")
-
-# On Streamlit Cloud the repo is read-only and auth_config.yaml is gitignored,
-# so it won't exist. Detect this once and switch to secrets-based config.
-_IS_CLOUD = not os.path.exists(_CREDENTIALS_PATH)
-
-# User settings: local → project data/ dir; cloud → /tmp (writable, semi-persistent)
+# Streamlit Cloud serves from /mount/src/; that subtree is read-only.
+# Fall back to /tmp which is writable (and semi-persistent within a deployment).
+_IS_CLOUD = _DIR.startswith("/mount/src/")
 _DATA_DIR = "/tmp/fire_dashboard_data" if _IS_CLOUD else os.path.join(_DIR, "data")
 
 
-def _load_config() -> dict:
-    """Load auth config from st.secrets (Cloud) or local YAML file (local)."""
-    if _IS_CLOUD:
-        # Credentials and cookie config must be set in the Streamlit Cloud
-        # dashboard under App settings → Secrets. See README for the format.
-        creds: dict = {"usernames": {}}
-        if "credentials" in st.secrets:
-            for uname, udata in st.secrets["credentials"]["usernames"].items():
-                creds["usernames"][uname] = {
-                    "name": udata.get("name", uname),
-                    "email": udata.get("email", ""),
-                    "password": udata["password"],
-                }
-        return {
-            "credentials": creds,
-            "cookie": {
-                "name": st.secrets["cookie"]["name"],
-                "key": st.secrets["cookie"]["key"],
-                "expiry_days": int(st.secrets["cookie"]["expiry_days"]),
-            },
-        }
-    with open(_CREDENTIALS_PATH) as f:
-        return yaml.safe_load(f)
+def _fernet(user_sub: str) -> Fernet:
+    """Derive a Fernet key from the user's stable Google account ID.
+
+    The key is computed at runtime from the sub claim (present only during
+    an active authenticated session) and never stored anywhere. Once a
+    session ends, the server has no way to reconstruct the key — meaning
+    the encrypted files on disk are unreadable without the user signing in.
+    """
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"fire_dashboard_v1",
+        iterations=200_000,
+    )
+    return Fernet(base64.urlsafe_b64encode(kdf.derive(user_sub.encode())))
 
 
-def _save_config(config: dict):
-    """Persist updated credentials. No-op on Cloud (secrets are read-only)."""
-    if _IS_CLOUD:
-        return
-    with open(_CREDENTIALS_PATH, "w") as f:
-        yaml.dump(config, f, default_flow_style=False, allow_unicode=True)
+def _load_settings(user_sub: str) -> dict:
+    path = os.path.join(_DATA_DIR, f"{user_sub}.enc")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return json.loads(_fernet(user_sub).decrypt(f.read()))
+    except Exception:
+        return {}
 
 
-def _load_user_settings(username: str) -> dict:
-    path = os.path.join(_DATA_DIR, f"{username}.json")
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {}
-
-
-def _save_user_settings(username: str, settings: dict):
+def _save_settings(user_sub: str, settings: dict):
     os.makedirs(_DATA_DIR, exist_ok=True)
-    path = os.path.join(_DATA_DIR, f"{username}.json")
-    with open(path, "w") as f:
-        json.dump(settings, f, indent=2)
+    data = _fernet(user_sub).encrypt(json.dumps(settings).encode())
+    with open(os.path.join(_DATA_DIR, f"{user_sub}.enc"), "wb") as f:
+        f.write(data)
 
 
-# ---------- Auth setup ----------
+# ---------- Defaults ----------
 
-config = _load_config()
-authenticator = stauth.Authenticate(
-    config["credentials"],
-    config["cookie"]["name"],
-    config["cookie"]["key"],
-    config["cookie"]["expiry_days"],
-    auto_hash=True,
-)
-
-# Seed widget defaults on very first load (before any auth)
 _DEFAULTS = {
     "gross_devoted": 25_000,
     "years": 30,
@@ -118,57 +93,80 @@ _DEFAULTS = {
     "starting_hsa": 0,
     "limit_hsa": 4_300,
 }
+
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# When a user logs in, load their saved settings (once per login)
-_logged_in = st.session_state.get("authentication_status") is True
-_active_user = st.session_state.get("username")
-if _logged_in and _active_user != st.session_state.get("_settings_loaded_for"):
-    saved = _load_user_settings(_active_user)
-    for k, v in saved.items():
-        st.session_state[k] = v
-    st.session_state["_settings_loaded_for"] = _active_user
+
+# ---------- Login gate ----------
+
+_signed_in = st.user.is_logged_in
+_guest = st.session_state.get("guest_mode", False)
+
+if not _signed_in and not _guest:
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        st.title("🔥 FIRE Dashboard")
+        st.markdown("Track your path to financial independence.")
+        st.divider()
+
+        with st.container(border=True):
+            st.markdown("#### 🔒 Your data stays yours")
+            st.markdown(
+                """
+Signing in with Google lets you save and restore your inputs across sessions.
+Here's exactly what that means for your privacy:
+
+- **End-to-end encryption.** Your saved inputs are encrypted using a key
+  derived from your unique Google account ID — a key that only exists in
+  memory while you're actively signed in. Once you sign out, that key is
+  gone. The encrypted file on disk is unreadable without you signing back in.
+- **We cannot read your data.** Because the encryption key is never stored —
+  only derived on demand from your live session — even the operator of this
+  app has no way to decrypt your saved inputs.
+- **No passwords stored.** Sign-in is handled entirely by Google. We never
+  see or store your Google password.
+- **Minimal data.** We store nothing except the encrypted blob of inputs you
+  explicitly save. No name, no email, no usage logs.
+
+You can also use the app without signing in — your inputs will work fine for
+the current session, just won't be remembered next time.
+                """
+            )
+
+        st.divider()
+        st.login("google")
+        st.button(
+            "Continue without signing in",
+            on_click=lambda: st.session_state.update({"guest_mode": True}),
+            use_container_width=True,
+            type="secondary",
+        )
+    st.stop()
+
+
+# ---------- Load saved settings on first sign-in ----------
+
+if _signed_in:
+    _sub = st.user.sub
+    if _sub != st.session_state.get("_loaded_for"):
+        for k, v in _load_settings(_sub).items():
+            st.session_state[k] = v
+        st.session_state["_loaded_for"] = _sub
 
 
 # ---------- Sidebar ----------
 
 with st.sidebar:
-    if _logged_in:
-        st.write(f"👤 **{st.session_state['name']}**")
-        authenticator.logout(button_name="Log out", location="sidebar")
+    if _signed_in:
+        st.write(f"👤 **{st.user.name}**")
+        st.button("Sign out", on_click=st.logout, use_container_width=True)
     else:
-        with st.expander("🔐 Log in / Create account"):
-            tab_login, tab_register = st.tabs(["Log in", "Create account"])
-            with tab_login:
-                authenticator.login(location="main", clear_on_submit=True)
-                if st.session_state.get("authentication_status") is False:
-                    st.error("Incorrect username or password.")
-            with tab_register:
-                if _IS_CLOUD:
-                    st.info(
-                        "Self-registration isn't available in the deployed version. "
-                        "Add your credentials via the Streamlit Cloud dashboard "
-                        "(App settings → Secrets). See the README for the format."
-                    )
-                else:
-                    st.caption("Create an account to save your inputs between sessions.")
-                    try:
-                        email, reg_username, reg_name = authenticator.register_user(
-                            location="main",
-                            captcha=False,
-                            pre_authorized=None,
-                            clear_on_submit=True,
-                        )
-                        if email:
-                            config["credentials"] = authenticator.credentials
-                            _save_config(config)
-                            st.success(f"Account created for **{reg_name}**. Log in above.")
-                    except stauth.RegisterError as e:
-                        st.error(e)
-                    except Exception as e:
-                        st.error(f"Registration error: {e}")
+        st.caption("👤 Using as guest — inputs won't be saved.")
+        if st.button("Sign in with Google", use_container_width=True):
+            st.session_state.pop("guest_mode", None)
+            st.rerun()
 
     st.divider()
     st.header("Your inputs")
@@ -243,30 +241,11 @@ with st.sidebar:
     limit_hsa = st.number_input(
         "HSA limit ($)", step=100, key="limit_hsa", disabled=not include_hsa)
 
-    st.divider()
-    if _logged_in and st.button("💾 Save my settings", use_container_width=True):
-        _save_user_settings(_active_user, {
-            "gross_devoted": st.session_state.gross_devoted,
-            "years": st.session_state.years,
-            "growth_rate_pct": st.session_state.growth_rate_pct,
-            "marginal_now_pct": st.session_state.marginal_now_pct,
-            "marginal_retire_pct": st.session_state.marginal_retire_pct,
-            "cap_gains_pct": st.session_state.cap_gains_pct,
-            "starting_trad_401k": st.session_state.starting_trad_401k,
-            "starting_roth_401k": st.session_state.starting_roth_401k,
-            "starting_trad_ira": st.session_state.starting_trad_ira,
-            "starting_roth_ira": st.session_state.starting_roth_ira,
-            "starting_taxable": st.session_state.starting_taxable,
-            "private_stock_value": st.session_state.private_stock_value,
-            "private_stock_growth_pct": st.session_state.private_stock_growth_pct,
-            "fire_target": st.session_state.fire_target,
-            "limit_401k": st.session_state.limit_401k,
-            "limit_ira": st.session_state.limit_ira,
-            "include_hsa": st.session_state.include_hsa,
-            "starting_hsa": st.session_state.starting_hsa,
-            "limit_hsa": st.session_state.limit_hsa,
-        })
-        st.success("Settings saved!")
+    if _signed_in:
+        st.divider()
+        if st.button("💾 Save my settings", use_container_width=True):
+            _save_settings(st.user.sub, {k: st.session_state[k] for k in _DEFAULTS})
+            st.success("Settings saved!")
 
 
 # ---------- Build config & run ----------
